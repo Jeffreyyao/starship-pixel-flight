@@ -4,7 +4,7 @@ Fly Starship yourself, with the arrow keys, in a browser. Everything is real 3D,
 
 ## Play
 
-**Online:** https://benbencfy.github.io/starship-pixel-flight/
+**Online:** https://jeffreyyao.github.io/starship-pixel-flight/
 
 Or run it locally:
 
