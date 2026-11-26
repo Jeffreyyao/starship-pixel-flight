@@ -69,6 +69,7 @@ const EARTH_RAMPS = {
   erock: ["#4a4038", "#6e6252"],
 };
 const SPACE_BG = "#020309";
+const SPACE_HAZE = "#0b1430"; // what the ground's haze fades to, high up
 const ATMO_GLOW = ["#2a5aa8", "#4f8fe0", "#9cc8f0"];
 const SPACE_PALETTE = [SPACE_BG, ...Object.values(EARTH_RAMPS).flat(), ...["steel", "tile", "tower", "warm", "red", "plasma"].flatMap((k) => NIGHT_RAMPS[k]), "#f4f2ea", "#fff6dc"];
 const BEAM = "#4fd0b0";
@@ -107,6 +108,7 @@ const uFog = dyno.dynoVec2(new THREE.Vector2(10, 50));
 const uAux = dyno.dynoVec4(new THREE.Vector4(0, CATCH[2], -1, 0)); // steam x, steam z, explosion age (<0 none), day (0/1)
 const uBoom = dyno.dynoVec3(new THREE.Vector3()); // explosion centre
 const uEx = dyno.dynoVec4(new THREE.Vector4(0, 1, 0, 0)); // sun direction (in space), booster throttle
+const uSpace = dyno.dynoFloat(0); // 0..1: how far the haze has faded into space on the way up
 
 const glslRamp = (name, hexes) => `
 vec3 ${name}(float l) {
@@ -125,7 +127,8 @@ vec4 ss_hash41(float p) {
   return fract((p4.xxyz + p4.yzzw) * p4.zywx);
 }
 ${Object.keys(NIGHT_RAMPS).map((k) => `${glslRamp(`ss_${k}_n`, NIGHT_RAMPS[k])}\n${glslRamp(`ss_${k}_d`, DAY_RAMPS[k])}\n#define ss_${k}(l) (DAYV > 0.5 ? ss_${k}_d(l) : ss_${k}_n(l))`).join("\n")}
-#define SS_FOG (DAYV > 0.5 ? ${vec3s(THEMES.day.fog)} : ${vec3s(THEMES.night.fog)})
+// the haze colour, darkening into space as the ship climbs (SPV)
+#define SS_FOG mix(DAYV > 0.5 ? ${vec3s(THEMES.day.fog)} : ${vec3s(THEMES.night.fog)}, ${vec3s(SPACE_HAZE)}, SPV)
 #define SS_BG SS_FOG
 #define SS_KEY (DAYV > 0.5 ? ${vec3n(THEMES.day.key)} : ${vec3n(THEMES.night.key)})
 ${Object.entries(EARTH_RAMPS).map(([k, v]) => glslRamp(`ss_${k}`, v)).join("\n")}
@@ -138,11 +141,11 @@ function fx(body, extra = {}) {
   const ex = Object.entries(extra);
   return dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
     const d = new dyno.Dyno({
-      inTypes: { gsplat: dyno.Gsplat, t: "float", cam: "vec3", eng: "vec3", fx: "vec4", fog: "vec2", aux: "vec4", boom: "vec3", ex: "vec4", ...Object.fromEntries(ex.map(([k, [t]]) => [k, t])) },
+      inTypes: { gsplat: dyno.Gsplat, t: "float", cam: "vec3", eng: "vec3", fx: "vec4", fog: "vec2", aux: "vec4", boom: "vec3", ex: "vec4", sp: "float", ...Object.fromEntries(ex.map(([k, [t]]) => [k, t])) },
       outTypes: { gsplat: dyno.Gsplat },
-      inputs: { gsplat, t: uTime, cam: uCam, eng: uEng, fx: uFx, fog: uFog, aux: uAux, boom: uBoom, ex: uEx, ...Object.fromEntries(ex.map(([k, [, v]]) => [k, v])) },
+      inputs: { gsplat, t: uTime, cam: uCam, eng: uEng, fx: uFx, fog: uFog, aux: uAux, boom: uBoom, ex: uEx, sp: uSpace, ...Object.fromEntries(ex.map(([k, [, v]]) => [k, v])) },
       globals: () => [GLOBALS],
-      statements: ({ inputs, outputs }) => [`${outputs.gsplat} = ${inputs.gsplat};`, `{ float DAYV = ${inputs.aux}.w;`, body(inputs, outputs.gsplat), "}"],
+      statements: ({ inputs, outputs }) => [`${outputs.gsplat} = ${inputs.gsplat};`, `{ float DAYV = ${inputs.aux}.w; float SPV = ${inputs.sp};`, body(inputs, outputs.gsplat), "}"],
     });
     return { gsplat: d.outputs.gsplat };
   });
@@ -737,6 +740,7 @@ const nextMission = (m) => MISSION_ORDER[(MISSION_ORDER.indexOf(m) + 1) % MISSIO
 let cur = { mission: "descent", diff: "cadet" };
 function startGame(missionId, diffId) {
   cur = { mission: missionId, diff: diffId };
+  clearTransition();
   resetFacilities();
   attachBooster();
   if (view !== "local") setView("local");
@@ -773,6 +777,7 @@ function togglePause() { paused = !paused; touch?.setPaused(paused); }
 function cycleCamera() { cam.zoom = (cam.zoom + 1) % ZOOMS.length; cam.snap = view === "space"; ui.toast(`CAMERA · ${(view === "space" ? SPACE_ZOOM_NAMES : ZOOM_NAMES)[cam.zoom]}`); }
 function toMenu() {
   mode = "menu";
+  clearTransition();
   game = null;
   orb = null;
   if (view !== "local") setView("local");
@@ -906,6 +911,32 @@ const D2R = Math.PI / 180;
 const SPACE_ZOOMS = [11, 30, 135], SPACE_ZOOM_NAMES = ["FOLLOW", "WIDE", "MAP"];
 const ORB_EVENTS = { liftoff: "LIFTOFF", staging: "STAGING · BOOSTER SEP", maxq: "MAX-Q", orbit: "ORBIT ACHIEVED", deorbit: "DEORBIT · HEADING HOME", ignite: "IGNITION", shutdown: "ENGINES OFF", flameout: "FLAMEOUT · NO FUEL" };
 
+// leaving and re-entering the air: the sky and haze fade into space with
+// altitude, and the switch between the launch view and space is a dissolve
+let trans = null; // { t, phase: "out" | "hold" | "in", to }
+function setSpaceFade(f) {
+  uSpace.value = f;
+  post.setSpaceFade(f, SPACE_BG);
+  if (view === "local") nightSky.visible = !isDay() || f > 0.45; // stars come out by day too, high up
+}
+const spaceFadeAt = (altKm) => smooth((altKm - 1.0) / 4.6);
+function beginTransition(to) { if (!trans) trans = { t: 0, phase: "out", to }; }
+function updateTransition(dt) {
+  if (!trans) return;
+  trans.t += dt;
+  if (trans.phase === "out") {
+    const k = Math.min(1, trans.t / 0.35);
+    post.setBlackout(k);
+    if (k >= 1) trans = trans.to ? (setView(trans.to), { t: 0, phase: "in" }) : { t: 0, phase: "hold" };
+  } else if (trans.phase === "hold") post.setBlackout(1);
+  else {
+    const k = Math.min(1, trans.t / 0.7);
+    post.setBlackout(1 - k);
+    if (k >= 1) { trans = null; post.setBlackout(0); }
+  }
+}
+function clearTransition() { trans = null; post.setBlackout(0); setSpaceFade(0); }
+
 function applySpace() {
   post.setPalette(SPACE_PALETTE, [...GLOW, ...ATMO_GLOW]);
   post.setSky([]);
@@ -954,6 +985,7 @@ function orientSpace(obj, nu, nv, bu, bv) {
 const renderPos = (u, v, out) => out.set(0, v * KM, -u * KM);
 
 function poseOrbitLocal(o, dt, now) {
+  setSpaceFade(spaceFadeAt(altOf(o)));
   const lp = orbitLocal(o), az = Math.sin(o.pitch * D2R), ay = Math.cos(o.pitch * D2R);
   const comY = (lp.y + ay * COM_Y * U) / U, comZ = (lp.z + az * COM_Y * U) / U;
   poseShip(comY, comZ, o.pitch);
@@ -998,6 +1030,7 @@ const camOff = new THREE.Vector3(), rr = new THREE.Vector3(), tt = new THREE.Vec
 let spaceLift = BOOSTER_H + 1.9;
 function poseOrbitSpace(o, dt, now) {
   const a = attitude(o), alt = altOf(o), speed = Math.hypot(o.vu, o.vv);
+  uSpace.value = 0;
   const liftWant = o.stage === 1 ? BOOSTER_H + 1.9 : 0.9;
   spaceLift += (liftWant - spaceLift) * (1 - Math.exp(-dt * 0.6));
   renderPos(o.u, o.v, vP);
@@ -1074,6 +1107,7 @@ function orbitSummary(o) {
 function startHandoff(o) {
   const h = handoff(o);
   if (!h.ok) {
+    if (trans) trans = { t: 0, phase: "in" };
     o.status = "missed";
     o.reason = h.err > 0 ? `Came down ${h.err.toFixed(0)} km short of Starbase, out in the Gulf (limit ±${o.d.window} km)` : `Came down ${(-h.err).toFixed(0)} km past Starbase, inland (limit ±${o.d.window} km)`;
     o.done = true;
@@ -1087,6 +1121,7 @@ function startHandoff(o) {
   attachBooster();
   groups.booster.visible = false;
   setView("local");
+  trans = { t: 0, phase: "in" }; // dissolve in over Starbase
   beams.descent.visible = true;
   steam = 0; acc = 0; caughtAt = -1; endTimer = 0;
   ui.showFlight(game);
@@ -1115,7 +1150,11 @@ function frameOrbit(dt, now, draw = true) {
     startHandoff(o);
     if (game) return frameGame(dt, now, draw);
   }
-  if (view === "local" && altOf(o) > 6 && o.status === "flying") setView("space");
+  if (view === "local" && altOf(o) > 5.6 && o.status === "flying") beginTransition("space");
+  // coming home: dissolve out just above the hand-off to Starbase
+  if (view === "space" && o.deorbited && altOf(o) < 3.0 && o.status === "flying") beginTransition(null);
+  // a failed ascent falling back: back to the launch view before it hits the ground
+  if (view === "space" && !o.inOrbit && altOf(o) < 4.5 && o.status === "flying") beginTransition("local");
   // predictions for the HUD and the map, a few times a second
   if (now > orbPredAt || orbPredAt - now > 1) {
     orbPredAt = now + 0.25;
@@ -1134,7 +1173,7 @@ function frameOrbit(dt, now, draw = true) {
     else crashFx(groups.root.position.clone(), null, 0);
   }
   if (view === "local") poseOrbitLocal(o, dt, now); else poseOrbitSpace(o, dt, now);
-  if (!paused) { if (uAux.value.z >= 0) uAux.value.z += dt; updateShatter(dt); }
+  if (!paused) { if (uAux.value.z >= 0) uAux.value.z += dt; updateShatter(dt); updateTransition(dt); }
   ui.updateOrbit(o, orbInfo);
   const [h, urgent] = paused ? [touchMode ? "PAUSED · tap ▶ to resume" : "PAUSED · P to resume", false] : coachOrbit(o, orbInfo);
   ui.hint(h, urgent);
@@ -1260,7 +1299,8 @@ function frameGame(dt, now, draw = true) {
   const target = thr * (1 - smooth((baseU - ground - 0.2) / 4));
   steam = target > steam ? lerp(steam, target, 1 - Math.exp(-dt * 2.5)) : lerp(steam, target, 1 - Math.exp(-dt * 0.35));
   const boomAge = uAux.value.z;
-  if (!paused) updateShatter(dt);
+  if (!paused) { updateShatter(dt); updateTransition(dt); }
+  setSpaceFade(g.missionKey === "orbit" ? spaceFadeAt(p.base[1] / 1000) : 0);
   if (boomAge >= 0) {
     if (!paused) uAux.value.z += dt;
     uEng.value.copy(uBoom.value);
@@ -1317,6 +1357,7 @@ function setTheme(name, announce = false) {
   ui?.setTime(themeName);
   touch?.setTime(themeName);
   if (view === "space") applySpace();
+  else setSpaceFade(uSpace.value);
   if (announce) ui?.toast(isDay() ? "☀ DAY" : "☾ NIGHT");
 }
 const toggleTheme = () => setTheme(isDay() ? "night" : "day", true);

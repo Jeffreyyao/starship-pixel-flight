@@ -43,6 +43,12 @@ export function createPost() {
     skyN: { value: 0 },
     invProj: { value: new THREE.Matrix4() },
     camWorld: { value: new THREE.Matrix4() },
+    // climbing out of the air: the sky darkens towards this colour
+    skyFade: { value: 0 },
+    fadeColor: { value: new THREE.Vector3() },
+    fadeMid: { value: new THREE.Vector3(...hexToRgb("#16306e")) }, // the deep blue on the way
+    // a dissolve to fadeColor over the whole picture, for changing scenes
+    blackout: { value: 0 },
   };
   const material = new THREE.ShaderMaterial({
     uniforms,
@@ -60,6 +66,8 @@ export function createPost() {
       uniform vec3 sky[6];
       uniform int skyN;
       uniform mat4 invProj, camWorld;
+      uniform float skyFade, blackout;
+      uniform vec3 fadeColor, fadeMid;
 
       // 4×4 ordered dither threshold in (0, 1)
       float bayer(vec2 p) {
@@ -161,7 +169,11 @@ export function createPost() {
         int k = min(i + (bayer(cell) < fr ? 1 : 0), skyN - 1);
         vec3 c = sky[0];
         for (int j = 0; j < 6; j++) if (j == k) c = sky[j];
-        return c;
+        // thinning air: each band deepens to a dark blue, then to space,
+        // the top of the sky first
+        float sf = clamp(skyFade * (0.7 + 0.6 * t), 0.0, 1.0);
+        c = mix(c, fadeMid, min(1.0, sf * 2.0));
+        return mix(c, fadeColor, max(0.0, sf * 2.0 - 1.0));
       }
       // a darker shade of a colour, never so dark that it vanishes into the background
       vec3 ink(vec3 body) {
@@ -221,6 +233,7 @@ export function createPost() {
           col = base * (1.0 - a) + sum.rgb;
           if (quantise > 0.5) col = a < 0.3 ? base : dither > 0.0 ? snapDither(col, cell, false) : haze(sum.rgb / max(a, 1e-4), a, base);
         }
+        if (blackout > 0.0 && bayer(cell + vec2(1.0, 3.0)) < blackout) col = fadeColor;
         gl_FragColor = vec4(col, 1.0);
       }`,
   });
@@ -246,6 +259,12 @@ export function createPost() {
       hexes.slice(0, 6).forEach((hex, i) => uniforms.sky.value[i].set(...hexToRgb(hex)));
       uniforms.skyN.value = Math.min(6, hexes.length);
     },
+    // 0..1: how far the sky has faded into space; and the whole-picture dissolve
+    setSpaceFade(amount, hex) {
+      uniforms.skyFade.value = amount;
+      if (hex) uniforms.fadeColor.value.set(...hexToRgb(hex));
+    },
+    setBlackout(amount) { uniforms.blackout.value = amount; },
     setCamera(camera) {
       uniforms.invProj.value.copy(camera.projectionMatrixInverse);
       uniforms.camWorld.value.copy(camera.matrixWorld);
